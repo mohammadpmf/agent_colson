@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/*.db
+data/conversations/
+logs/*.log
+*.db
+.idea/
+.vscode/
+.pytest_cache/
+*.egg-info/
