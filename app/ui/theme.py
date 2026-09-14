@@ -14,7 +14,7 @@ QLabel#StatusOk { color: #4ade80; font-weight: 600; }
 QLabel#StatusBad { color: #f87171; font-weight: 600; }
 QPushButton {
     background: #2a2b2f; color: #e6e6e6; border: 1px solid #35363a;
-    border-radius: 6px; padding: 6px 12px;
+    border-radius: 6px; padding: 6px 14px; min-height: 28px;
 }
 QPushButton:hover { background: #35363a; }
 QPushButton:pressed { background: #404146; }
@@ -22,6 +22,13 @@ QPushButton#Primary { background: #2563eb; border-color: #2563eb; color: white; 
 QPushButton#Primary:hover { background: #1d4ed8; }
 QPushButton#Danger { background: #7f1d1d; border-color: #991b1b; color: #fee2e2; }
 QPushButton#Danger:hover { background: #991b1b; }
+QPushButton#CopyButton {
+    background: #2a2b2f; color: #e6e6e6; border: 1px solid #35363a;
+    border-radius: 6px; padding: 6px 14px; min-height: 32px; min-width: 72px;
+    font-size: 13px;
+}
+QPushButton#CopyButton:hover { background: #35363a; }
+QPushButton#CopyButton:pressed { background: #404146; }
 QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background: #202124; color: #e6e6e6; border: 1px solid #35363a; border-radius: 6px; padding: 6px;
 }
@@ -58,12 +65,18 @@ QLabel#StatusOk { color: #16a34a; font-weight: 600; }
 QLabel#StatusBad { color: #dc2626; font-weight: 600; }
 QPushButton {
     background: #ffffff; color: #202124; border: 1px solid #d5d5d8;
-    border-radius: 6px; padding: 6px 12px;
+    border-radius: 6px; padding: 6px 14px; min-height: 28px;
 }
 QPushButton:hover { background: #f0f0f3; }
 QPushButton#Primary { background: #2563eb; border-color: #2563eb; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #1d4ed8; }
 QPushButton#Danger { background: #dc2626; border-color: #dc2626; color: white; }
+QPushButton#CopyButton {
+    background: #ffffff; color: #202124; border: 1px solid #d5d5d8;
+    border-radius: 6px; padding: 6px 14px; min-height: 32px; min-width: 72px;
+    font-size: 13px;
+}
+QPushButton#CopyButton:hover { background: #f0f0f3; }
 QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background: #ffffff; color: #202124; border: 1px solid #d5d5d8; border-radius: 6px; padding: 6px;
 }

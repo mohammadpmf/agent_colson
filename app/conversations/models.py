@@ -15,9 +15,10 @@ def _new_id() -> str:
 @dataclass
 class StoredMessage:
     role: str
-    content: str
+    content: str = ""
     timestamp: float = field(default_factory=time.time)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_call_id: str | None = None
     tool_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -30,6 +31,7 @@ class StoredMessage:
             content=raw.get("content", ""),
             timestamp=raw.get("timestamp", time.time()),
             tool_calls=list(raw.get("tool_calls", [])),
+            tool_call_id=raw.get("tool_call_id"),
             tool_name=raw.get("tool_name"),
         )
 

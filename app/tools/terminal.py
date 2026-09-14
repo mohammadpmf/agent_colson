@@ -27,8 +27,9 @@ class RunCommandTool(Tool):
         "require an explicit confirmation."
     )
 
-    dangerous = True @ property
+    dangerous = True
 
+    @property
     def schema(self) -> dict[str, Any]:
         return {
             "type": "object",

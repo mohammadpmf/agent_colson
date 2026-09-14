@@ -19,6 +19,7 @@ from app.permissions import (
 from app.providers import (
     ChatMessage,
     DeepSeekError,
+    GapGPTError,
     LLMProvider,
     LLMResponse,
     ToolCall,
@@ -36,6 +37,7 @@ MAX_TOOL_ITERATIONS = 25
 class AgentState(str, Enum):
     IDLE = "idle"
     PLANNING = "planning"
+    WAITING_FOR_API = "waiting_for_api"
     RUNNING = "running"
     WAITING_FOR_PERMISSION = "waiting_for_permission"
     COMPLETED = "completed"
@@ -102,7 +104,6 @@ class AgentEngine:
         self._cancel = threading.Event()
         self._thread: threading.Thread | None = None
 
-    # ------------------------------------------------------------------ #
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -110,7 +111,6 @@ class AgentEngine:
     def cancel(self) -> None:
         self._cancel.set()
 
-    # ------------------------------------------------------------------ #
     def start(
         self,
         history: list[ChatMessage],
@@ -130,8 +130,12 @@ class AgentEngine:
         )
         self._thread.start()
 
-    # ------------------------------------------------------------------ #
     def _run(self, history: list[ChatMessage], user_input: str | None) -> None:
+        log.info(
+            "[engine] _run started (history=%d, user_input=%s)",
+            len(history),
+            bool(user_input),
+        )
         try:
             messages: list[ChatMessage] = [
                 ChatMessage(role="system", content=SYSTEM_PROMPT)
@@ -149,14 +153,23 @@ class AgentEngine:
                     self._finish(AgentState.CANCELED)
                     return
 
-                trimmed = self.context_manager.trim(messages)
-                self.state = AgentState.RUNNING
+                log.info("[engine] iteration %d — calling LLM", iteration)
+                self.state = AgentState.WAITING_FOR_API
                 self._emit_state()
 
+                trimmed = self.context_manager.trim(messages)
                 response = self._call_llm(trimmed, tools)
-                if response is None:  # cancelled
+                if response is None:
+                    log.info("[engine] LLM returned None (cancel or error)")
                     self._finish(AgentState.CANCELED)
                     return
+
+                log.info(
+                    "[engine] LLM response: content=%d chars, tool_calls=%d, finish=%s",
+                    len(response.content or ""),
+                    len(response.tool_calls or []),
+                    response.finish_reason,
+                )
 
                 self.usage.input_tokens += response.input_tokens
                 self.usage.output_tokens += response.output_tokens
@@ -179,21 +192,38 @@ class AgentEngine:
                         )
                     )
 
-                # No tool calls → final answer
                 if not response.tool_calls:
                     self._finish(AgentState.COMPLETED)
                     return
 
-                # Attach the assistant message (with tool calls) to history
+                # Emit TOOL_CALL events FIRST so the UI can store them as
+                # assistant tool-call messages in history before the tool
+                # results are appended. This keeps the pairing intact:
+                #   assistant(tool_calls)  ->  tool(result)  ->  ...
+                for call in response.tool_calls:
+                    self.emit(
+                        AgentEvent(
+                            AgentEventType.TOOL_CALL,
+                            {
+                                "id": call.id,
+                                "name": call.name,
+                                "arguments": call.arguments,
+                            },
+                        )
+                    )
+
+                # The API-side payload uses a single assistant message with
+                # the tool calls (content null). We DO NOT include any text
+                # alongside tool_calls, because some OpenAI-compatible
+                # backends reject that.
                 messages.append(
                     ChatMessage(
                         role="assistant",
-                        content=response.content or "",
+                        content="",
                         tool_calls=response.tool_calls,
                     )
                 )
 
-                # Execute each tool call
                 for call in response.tool_calls:
                     if self._cancel.is_set():
                         self._finish(AgentState.CANCELED)
@@ -201,7 +231,6 @@ class AgentEngine:
                     result_msg = self._execute_tool(call)
                     messages.append(result_msg)
 
-            # Loop exhausted
             self.emit(
                 AgentEvent(
                     AgentEventType.ERROR,
@@ -217,7 +246,6 @@ class AgentEngine:
             self.emit(AgentEvent(AgentEventType.ERROR, {"message": str(exc)}))
             self._finish(AgentState.FAILED)
 
-    # ------------------------------------------------------------------ #
     def _call_llm(
         self, messages: list[ChatMessage], tools: list[dict[str, Any]]
     ) -> LLMResponse | None:
@@ -227,6 +255,9 @@ class AgentEngine:
             streamed_any["flag"] = True
             self.emit(AgentEvent(AgentEventType.ASSISTANT_TOKEN, {"delta": piece}))
 
+        self.state = AgentState.RUNNING
+        self._emit_state()
+
         try:
             response = self.provider.chat(
                 messages=messages,
@@ -235,14 +266,18 @@ class AgentEngine:
                 on_token=on_token,
                 cancel_flag=self._cancel.is_set,
             )
-        except DeepSeekError as exc:
+        except (DeepSeekError, GapGPTError) as exc:
+            log.error("[engine] provider error: %s", exc)
+            self.emit(AgentEvent(AgentEventType.ERROR, {"message": str(exc)}))
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[engine] provider.chat crashed")
             self.emit(AgentEvent(AgentEventType.ERROR, {"message": str(exc)}))
             return None
 
         if self._cancel.is_set():
             return None
 
-        # If the model produced content only via tool calls, still emit final content.
         if response.content and not streamed_any["flag"]:
             self.emit(
                 AgentEvent(
@@ -252,36 +287,37 @@ class AgentEngine:
             )
         return response
 
-    # ------------------------------------------------------------------ #
     def _execute_tool(self, call: ToolCall) -> ChatMessage:
         tool: Tool | None = self.registry.get(call.name)
-
-        self.emit(
-            AgentEvent(
-                AgentEventType.TOOL_CALL,
-                {"id": call.id, "name": call.name, "arguments": call.arguments},
-            )
-        )
 
         if tool is None:
             output = f"ERROR: unknown tool '{call.name}'"
             self.emit(
                 AgentEvent(
                     AgentEventType.TOOL_RESULT,
-                    {"id": call.id, "name": call.name, "ok": False, "output": output},
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "ok": False,
+                        "output": output,
+                    },
                 )
             )
             return ChatMessage(
                 role="tool", content=output, tool_call_id=call.id, name=call.name
             )
 
-        # Per-tool pre-check (arguments schema)
         if not isinstance(call.arguments, dict):
             output = "ERROR: tool arguments must be a JSON object."
             self.emit(
                 AgentEvent(
                     AgentEventType.TOOL_RESULT,
-                    {"id": call.id, "name": call.name, "ok": False, "output": output},
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "ok": False,
+                        "output": output,
+                    },
                 )
             )
             return ChatMessage(
@@ -320,7 +356,6 @@ class AgentEngine:
             role="tool", content=output, tool_call_id=call.id, name=call.name
         )
 
-    # ------------------------------------------------------------------ #
     def _emit_state(self) -> None:
         self.emit(AgentEvent(AgentEventType.STATE, {"state": self.state.value}))
 
@@ -330,7 +365,6 @@ class AgentEngine:
         self.emit(AgentEvent(AgentEventType.DONE, {"state": state.value}))
 
 
-# ---------------------------------------------------------------------- #
 def parse_tool_arguments(raw: str | dict[str, Any]) -> dict[str, Any]:
     """Safely parse a raw tool-call argument payload (never use eval)."""
     if isinstance(raw, dict):

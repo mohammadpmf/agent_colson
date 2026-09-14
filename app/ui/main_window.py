@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal, QEventLoop
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
@@ -32,7 +34,13 @@ from app.permissions import (
     PermissionRequest,
 )
 from app.permissions.storage import PermissionStorage
-from app.providers import ChatMessage, DeepSeekProvider, LLMProvider
+from app.providers import (
+    ChatMessage,
+    DeepSeekProvider,
+    GapGPTProvider,
+    LLMProvider,
+    ToolCall,
+)
 from app.tools import ToolContext, build_default_registry
 from app.workspace import WorkspaceManager
 
@@ -42,6 +50,7 @@ from .explorer import ExplorerPanel
 from .permission_dialog import PermissionDialog
 from .settings_dialog import SettingsDialog
 from .theme import stylesheet
+from .workers import run_in_thread
 
 log = logging.getLogger(__name__)
 
@@ -49,11 +58,16 @@ log = logging.getLogger(__name__)
 class MainWindow(QMainWindow):
     """Top-level window: sidebar, chat, activity panel, composer."""
 
+    _permission_requested = Signal(object, object)
+    _agent_event = Signal(object)
+
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self.config = config
-        self.setWindowTitle("DeepSeek Local Agent")
+        self.setWindowTitle("Local Coding Agent")
         self.resize(1400, 900)
+
+        self._agent_event.connect(self._apply_agent_event)
 
         # ---- core services ------------------------------------------------
         self.workspace = WorkspaceManager()
@@ -72,24 +86,27 @@ class MainWindow(QMainWindow):
         self.registry = build_default_registry()
         self.conversation_store = ConversationStore(config.data_dir / "conversations")
 
-        # current conversation + agent
         self.conversation = Conversation(
             workspace=str(self.workspace.root or ""),
             model=config.model,
         )
         self.agent: AgentEngine | None = None
-        self._pending_stream_widget = None
+
+        self._conn_thread = None
+        self._conn_worker = None
 
         # ---- UI -----------------------------------------------------------
         self._build_ui()
         self._apply_theme(config.theme)
         self._build_menus()
         self._wire_shortcuts()
-        self._refresh_connection_status()
         self._refresh_recent_chats()
+        self._update_workspace_label()
+
+        QTimer.singleShot(100, self._refresh_connection_status)
 
         if not self.workspace.root:
-            QTimer.singleShot(200, self._prompt_first_run)
+            QTimer.singleShot(400, self._prompt_first_run)
 
     # ------------------------------------------------------------------ #
     # UI construction
@@ -137,7 +154,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 8, 14, 8)
         layout.setSpacing(10)
 
-        title = QLabel("DeepSeek Agent")
+        title = QLabel("Local Coding Agent")
         title.setObjectName("Title")
         layout.addWidget(title)
 
@@ -145,13 +162,16 @@ class MainWindow(QMainWindow):
         self.conn_status.setObjectName("StatusBad")
         layout.addWidget(self.conn_status)
 
+        self.provider_label = QLabel(f"({self.config.provider})")
+        self.provider_label.setObjectName("Sub")
+        layout.addWidget(self.provider_label)
+
         self.workspace_label = QLabel("Workspace: (none)")
         self.workspace_label.setObjectName("Sub")
         layout.addWidget(self.workspace_label)
 
         layout.addStretch(1)
 
-        # Mode selector
         layout.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Agent", "Ask"])
@@ -270,10 +290,62 @@ class MainWindow(QMainWindow):
         if not self.config.api_key:
             self.conn_status.setText("● not configured")
             self.conn_status.setObjectName("StatusBad")
-        else:
-            self.conn_status.setText("● configured")
-            self.conn_status.setObjectName("StatusOk")
+            self._restyle(self.conn_status)
+            self._set_status(
+                f"No API key configured for {self.config.provider}. "
+                f"Open Settings → {self.config.provider.title()}."
+            )
+            return
+
+        self.conn_status.setText("● testing…")
+        self.conn_status.setObjectName("StatusBad")
         self._restyle(self.conn_status)
+
+        provider_name = self.config.provider
+        api_key = self.config.api_key
+        base_url = self.config.base_url
+        model = self.config.model
+
+        def _test() -> tuple[bool, str]:
+            if provider_name == "gapgpt":
+                p = GapGPTProvider(
+                    api_key=api_key, model=model, base_url=base_url, timeout=20
+                )
+            else:
+                p = DeepSeekProvider(
+                    api_key=api_key, model=model, base_url=base_url, timeout=20
+                )
+            return p.test_connection()
+
+        thread, worker = run_in_thread(self, _test)
+
+        def _on_done(result) -> None:
+            ok, msg = result
+            if ok:
+                self.conn_status.setText("● connected")
+                self.conn_status.setObjectName("StatusOk")
+                self.activity.add(f"{provider_name}: {msg}", "✓")
+            else:
+                self.conn_status.setText("● offline")
+                self.conn_status.setObjectName("StatusBad")
+                self.activity.add(f"{provider_name}: {msg}", "!")
+                QMessageBox.warning(
+                    self,
+                    f"{provider_name} connection failed",
+                    f"{msg}\n\nCheck your API key in Settings → {provider_name.title()}.",
+                )
+            self._restyle(self.conn_status)
+
+        def _on_fail(err: str) -> None:
+            self.conn_status.setText("● error")
+            self.conn_status.setObjectName("StatusBad")
+            self._restyle(self.conn_status)
+            self.activity.add(f"{provider_name} test failed: {err}", "!")
+
+        worker.finished.connect(_on_done)
+        worker.failed.connect(_on_fail)
+        self._conn_thread = thread
+        self._conn_worker = worker
 
     def _restyle(self, widget: QWidget) -> None:
         widget.style().unpolish(widget)
@@ -284,6 +356,15 @@ class MainWindow(QMainWindow):
 
     def _set_tokens(self, input_tokens: int, output_tokens: int) -> None:
         self.token_label.setText(f"tokens: {input_tokens:,} in / {output_tokens:,} out")
+
+    def _update_workspace_label(self) -> None:
+        if self.workspace.root:
+            self.workspace_label.setText(f"Workspace: {self.workspace.root.name}")
+        else:
+            self.workspace_label.setText("Workspace: (none)")
+
+    def _update_provider_label(self) -> None:
+        self.provider_label.setText(f"({self.config.provider})")
 
     # ------------------------------------------------------------------ #
     # Workspace
@@ -301,7 +382,7 @@ class MainWindow(QMainWindow):
         self.config.add_recent_workspace(str(self.workspace.root))
         self.config.save()
         self.permissions.set_workspace(self.workspace.root)
-        self.workspace_label.setText(f"Workspace: {self.workspace.root.name}")
+        self._update_workspace_label()
         self.explorer.refresh()
         self.conversation.workspace = str(self.workspace.root)
         self._set_status(f"Workspace: {self.workspace.root}")
@@ -360,7 +441,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "API key missing",
-                "Please enter your DeepSeek API key in Settings.",
+                f"Please enter your {self.config.provider} API key in Settings.",
             )
             return
 
@@ -370,15 +451,7 @@ class MainWindow(QMainWindow):
         if len(self.conversation.messages) == 1:
             self.conversation.title = text[:60]
 
-        # Build history from stored messages
-        history: list[ChatMessage] = []
-        for m in self.conversation.messages[:-1]:  # exclude the one we just added
-            if m.role in ("user", "assistant"):
-                history.append(ChatMessage(role=m.role, content=m.content))
-            elif m.role == "tool":
-                history.append(
-                    ChatMessage(role="tool", content=m.content, name=m.tool_name)
-                )
+        history = self._build_api_history(exclude_last=True)
 
         provider = self._make_provider()
         tool_ctx = ToolContext(workspace=self.workspace, permissions=self.permissions)
@@ -390,13 +463,70 @@ class MainWindow(QMainWindow):
             mode=self._current_mode(),
             emit=self._handle_agent_event,
             context_manager=ContextManager(
-                max_tokens=max(4096, self.config.max_tokens * 4)
+                max_tokens=12_000,
+                keep_last=8,
+                max_tool_result_chars=2_000,
             ),
         )
         self.stop_btn.setEnabled(True)
         self._set_status("Agent running…")
         self.activity.add("Planning…", "⟳")
         self.agent.start(history=history, user_input=text)
+
+    def _build_api_history(self, exclude_last: bool = False) -> list[ChatMessage]:
+        """Convert stored messages into provider ChatMessages.
+
+        Every `assistant` message that carries tool_calls is followed by one
+        `tool` message per call — the pairing OpenAI-compatible backends
+        require.
+        """
+        stored = self.conversation.messages
+        if exclude_last and stored and stored[-1].role == "user":
+            stored = stored[:-1]
+
+        history: list[ChatMessage] = []
+        for m in stored:
+            if m.role == "user":
+                history.append(ChatMessage(role="user", content=m.content))
+                continue
+
+            if m.role == "assistant":
+                if m.tool_calls:
+                    tcs: list[ToolCall] = []
+                    for tc in m.tool_calls:
+                        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                        try:
+                            args = json.loads(fn.get("arguments", "{}") or "{}")
+                        except json.JSONDecodeError:
+                            args = {}
+                        tcs.append(
+                            ToolCall(
+                                id=tc.get("id", ""),
+                                name=fn.get("name", ""),
+                                arguments=args,
+                            )
+                        )
+                    history.append(
+                        ChatMessage(
+                            role="assistant",
+                            content="",
+                            tool_calls=tcs,
+                        )
+                    )
+                else:
+                    history.append(ChatMessage(role="assistant", content=m.content))
+                continue
+
+            if m.role == "tool":
+                history.append(
+                    ChatMessage(
+                        role="tool",
+                        content=m.content,
+                        tool_call_id=m.tool_call_id,
+                        name=m.tool_name,
+                    )
+                )
+        return history
 
     def _stop(self) -> None:
         if self.agent and self.agent.is_running:
@@ -405,76 +535,116 @@ class MainWindow(QMainWindow):
             self._set_status("Cancelling…")
 
     def _make_provider(self) -> LLMProvider:
+        if self.config.provider == "gapgpt":
+            return GapGPTProvider(
+                api_key=self.config.gapgpt_api_key,
+                model=self.config.gapgpt_model,
+                base_url=self.config.gapgpt_base_url,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+            )
         return DeepSeekProvider(
-            api_key=self.config.api_key,
-            model=self.config.model,
-            base_url=self.config.base_url,
+            api_key=self.config.deepseek_api_key,
+            model=self.config.deepseek_model,
+            base_url=self.config.deepseek_base_url,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
         )
 
     # ------------------------------------------------------------------ #
-    # Agent events → UI (Qt signals may be emitted from any thread if we
-    # use a queued connection; we go through QTimer.singleShot to be safe)
+    # Agent events
     # ------------------------------------------------------------------ #
     def _handle_agent_event(self, event: AgentEvent) -> None:
-        QTimer.singleShot(0, lambda: self._apply_agent_event(event))
+        self._agent_event.emit(event)
 
     def _apply_agent_event(self, event: AgentEvent) -> None:
         if event.type == AgentEventType.STATE:
             self._on_state(event.payload.get("state", ""))
+
         elif event.type == AgentEventType.ASSISTANT_TOKEN:
             self.chat.append_stream(event.payload.get("delta", ""))
+
         elif event.type == AgentEventType.ASSISTANT_MESSAGE:
             content = event.payload.get("content", "")
-            if content:
-                widget = self.chat.add_message("assistant", content)
-                self.conversation.messages.append(
-                    StoredMessage(role="assistant", content=content)
-                )
+            if not content:
+                return
+            if self.chat.has_active_stream():
+                self.chat.finalize_stream(content)
+            else:
+                self.chat.add_message("assistant", content)
+            self.conversation.messages.append(
+                StoredMessage(role="assistant", content=content)
+            )
+
         elif event.type == AgentEventType.TOOL_CALL:
             name = event.payload.get("name", "")
             args = event.payload.get("arguments", {})
+            call_id = event.payload.get("id", "")
             summary = _summarize_tool_call(name, args)
             self.activity.add(f"{name}: {summary}", "▶")
+
+            # Persist the assistant tool-call message so the matching tool
+            # result has a proper parent when the history is rebuilt.
+            self.conversation.messages.append(
+                StoredMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(args, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                )
+            )
+
         elif event.type == AgentEventType.TOOL_RESULT:
             name = event.payload.get("name", "")
             ok = event.payload.get("ok", False)
             output = event.payload.get("output", "")
+            call_id = event.payload.get("id", "")
             icon = "✓" if ok else "✗"
             self.activity.add(f"{name} → {icon}", icon)
             self.conversation.messages.append(
                 StoredMessage(
                     role="tool",
                     content=output,
+                    tool_call_id=call_id,
                     tool_name=name,
                 )
             )
+
         elif event.type == AgentEventType.ERROR:
             msg = event.payload.get("message", "Unknown error")
             self.activity.add(msg, "!")
+            self.chat.end_streaming()
             self.chat.add_message("assistant", f"⚠️ Error: {msg}")
+
         elif event.type == AgentEventType.USAGE:
             self._set_tokens(
                 int(event.payload.get("input", 0)),
                 int(event.payload.get("output", 0)),
             )
+
         elif event.type == AgentEventType.DONE:
             self.chat.end_streaming()
             state = event.payload.get("state", "completed")
             self._set_status(f"Agent: {state}")
             self.stop_btn.setEnabled(False)
-            self.conversation.updated_at = __import__("time").time()
+            self.conversation.updated_at = time.time()
             self.conversation_store.save(self.conversation)
             self._refresh_recent_chats()
-            self.workspace_label.setText(
-                f"Workspace: {self.workspace.root.name if self.workspace.root else '(none)'}"
-            )
+            self._update_workspace_label()
 
     def _on_state(self, state: str) -> None:
         mapping = {
             "idle": "Idle",
             "planning": "Planning…",
+            "waiting_for_api": "Waiting for API…",
             "running": "Running…",
             "waiting_for_permission": "Waiting for permission…",
             "completed": "Done",
@@ -484,30 +654,31 @@ class MainWindow(QMainWindow):
         self._set_status(f"Agent: {mapping.get(state, state)}")
 
     # ------------------------------------------------------------------ #
-    # Permission flow (called synchronously from the agent thread)
+    # Permission flow
     # ------------------------------------------------------------------ #
     def _ask_permission(self, request: PermissionRequest) -> PermissionDecision:
-        # The callback runs in the worker thread → must marshal to GUI thread.
-        from PySide6.QtCore import QMetaObject, Qt as QtNS, Q_ARG
+        result: dict[str, PermissionDecision] = {"decision": PermissionDecision.DENY}
+        loop = QEventLoop()
 
-        holder: dict[str, PermissionDecision] = {"decision": PermissionDecision.DENY}
+        def _handle(req, holder):
+            try:
+                dlg = PermissionDialog(req, self)
+                dlg.exec()
+                holder["decision"] = dlg.decision
+            finally:
+                loop.quit()
 
-        def _show() -> None:
-            dlg = PermissionDialog(request, self)
-            dlg.exec()
-            holder["decision"] = dlg.decision
+        conn = self._permission_requested.connect(_handle)
+        try:
+            self._permission_requested.emit(request, result)
+            loop.exec()
+        finally:
+            try:
+                self._permission_requested.disconnect(conn)
+            except (RuntimeError, TypeError):
+                pass
 
-        QMetaObject.invokeMethod(
-            self,
-            "_invoke_dialog",
-            QtNS.BlockingQueuedConnection,
-            Q_ARG(object, _show),
-        )
-        return holder["decision"]
-
-    # Invoked via QMetaObject for cross-thread dispatch
-    def _invoke_dialog(self, fn) -> None:  # noqa: ANN001
-        fn()
+        return result["decision"]
 
     # ------------------------------------------------------------------ #
     # Settings / misc
@@ -520,24 +691,25 @@ class MainWindow(QMainWindow):
     def _on_config_saved(self, config: AppConfig) -> None:
         self.config = config
         self._apply_theme(config.theme)
-        self._refresh_connection_status()
+        self._update_provider_label()
         self._set_status("Settings saved.")
+        self._refresh_connection_status()
 
     def _about(self) -> None:
         QMessageBox.information(
             self,
-            "About DeepSeek Local Agent",
+            "About Local Coding Agent",
             "A local, permission-first coding agent.\n\n"
-            "Built with PySide6 + DeepSeek API.\n"
+            "Supports GapGPT and DeepSeek as OpenAI-compatible backends.\n"
             "All file and command operations require your approval.",
         )
 
     def _prompt_first_run(self) -> None:
         answer = QMessageBox.question(
             self,
-            "Welcome to DeepSeek Local Agent",
+            "Welcome to Local Coding Agent",
             "Welcome!\n\n"
-            "1. Enter your DeepSeek API key (Settings → API)\n"
+            "1. Enter your GapGPT (or DeepSeek) API key in Settings\n"
             "2. Choose a workspace folder\n"
             "3. Start chatting\n\n"
             "Open Settings now?",
@@ -546,7 +718,6 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.Yes:
             self._open_settings()
 
-    # ------------------------------------------------------------------ #
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.conversation.messages:
             self.conversation_store.save(self.conversation)
@@ -555,7 +726,6 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-# ---------------------------------------------------------------------- #
 def _summarize_tool_call(name: str, args: dict) -> str:
     try:
         if name in (

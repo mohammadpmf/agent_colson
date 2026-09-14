@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Protocol
 
 
 @dataclass
@@ -26,36 +27,43 @@ class ChatMessage:
     name: str | None = None
 
     def to_api(self) -> dict[str, Any]:
-        """Serialize into the OpenAI-compatible chat format."""
-        msg: dict[str, Any] = {"role": self.role, "content": self.content}
-        if self.tool_calls:
+        """Serialize into the OpenAI-compatible chat format.
+
+        Strict rules enforced here:
+          * assistant + tool_calls => content must be null (not "")
+          * tool messages must have a non-empty tool_call_id
+          * tool messages must have non-empty content
+        """
+        msg: dict[str, Any] = {"role": self.role}
+
+        if self.role == "assistant" and self.tool_calls:
+            msg["content"] = None
             msg["tool_calls"] = [
                 {
-                    "id": tc.id,
+                    "id": tc.id or f"call_{i}",
                     "type": "function",
                     "function": {
                         "name": tc.name,
                         "arguments": _json_dumps(tc.arguments),
                     },
                 }
-                for tc in self.tool_calls
+                for i, tc in enumerate(self.tool_calls)
             ]
-        if self.tool_call_id:
+            return msg
+
+        if self.role == "tool":
+            if not self.tool_call_id:
+                self.tool_call_id = "call_orphan"
+            if not self.content:
+                self.content = "(empty tool result)"
             msg["tool_call_id"] = self.tool_call_id
-        if self.name:
-            msg["name"] = self.name
+            if self.name:
+                msg["name"] = self.name
+            msg["content"] = self.content
+            return msg
+
+        msg["content"] = self.content or ""
         return msg
-
-
-@dataclass
-class LLMResponse:
-    """A complete (non-streamed) response from the model."""
-
-    content: str = ""
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    finish_reason: str = "stop"
-    input_tokens: int = 0
-    output_tokens: int = 0
 
 
 class LLMProvider(Protocol):
@@ -70,20 +78,23 @@ class LLMProvider(Protocol):
         stream: bool = True,
         on_token: Callable[[str], None] | None = None,
         cancel_flag: Callable[[], bool] | None = None,
-    ) -> LLMResponse:
-        """Send a chat request and return the final response."""
-        ...
+    ) -> "LLMResponse": ...
 
-    def is_configured(self) -> bool:
-        """Return True if the provider has credentials."""
-        ...
+    def is_configured(self) -> bool: ...
 
-    def test_connection(self) -> tuple[bool, str]:
-        """Verify credentials. Returns (ok, message)."""
-        ...
+    def test_connection(self) -> tuple[bool, str]: ...
+
+
+@dataclass
+class LLMResponse:
+    """A complete (non-streamed) response from the model."""
+
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    finish_reason: str = "stop"
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 def _json_dumps(obj: Any) -> str:
-    import json
-
     return json.dumps(obj, ensure_ascii=False)

@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import html
 import re
-from typing import Iterable
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont, QGuiApplication, QTextCursor
+from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -22,25 +21,97 @@ from PySide6.QtWidgets import (
 
 _CODE_BLOCK_RE = re.compile(r"```(\w+)?\n(.*?)```", re.DOTALL)
 
+# Unicode ranges that count as "strong RTL" for direction detection.
+_RTL_CHARS = re.compile(
+    "[\u0590-\u05ff"  # Hebrew
+    "\u0600-\u06ff"  # Arabic
+    "\u0700-\u074f"  # Syriac
+    "\u0750-\u077f"  # Arabic Supplement
+    "\u0780-\u07bf"  # Thaana
+    "\u08a0-\u08ff"  # Arabic Extended-A
+    "\ufb1d-\ufdff"  # Hebrew + Arabic presentation
+    "\ufe70-\ufeff"  # Arabic presentation forms B
+    "\U00010800-\U00010fff"  # various historic scripts
+    "\U0001e900-\U0001e95f"  # Adlam
+    "]"
+)
+
+# "strong LTR" = letters from Latin/Greek/Cyrillic blocks.
+_LTR_CHARS = re.compile(
+    "[A-Za-z"
+    "\u00c0-\u024f"  # Latin extended
+    "\u0370-\u03ff"  # Greek
+    "\u0400-\u04ff"  # Cyrillic
+    "\u1e00-\u1eff"  # Latin extended additional
+    "]"
+)
+
+
+def _line_direction(line: str) -> str:
+    """Return 'rtl', 'ltr', or 'neutral' for a single line of text."""
+    rtl = bool(_RTL_CHARS.search(line))
+    ltr = bool(_LTR_CHARS.search(line))
+    if rtl and ltr:
+        return "mixed"
+    if rtl:
+        return "rtl"
+    if ltr:
+        return "ltr"
+    return "neutral"
+
+
+def _isolate_ltr_runs(text: str) -> str:
+    """Inside a mixed RTL line, wrap Latin runs in <span dir="ltr">.
+
+    This lets the outer RTL paragraph keep its right-to-left base direction
+    while Latin segments (like 'How can I assist you today?') render as
+    proper LTR islands with the punctuation on their right side.
+    """
+    # A "Latin run" = one or more chars from the Latin/Greek/Cyrillic ranges,
+    # optionally including the punctuation that commonly attaches to them.
+    pattern = re.compile(
+        r"([A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u1E00-\u1EFF"
+        r"0-9][A-Za-z0-9\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u1E00-\u1EFF\s\.\,\!\?\'\"\-\_\:\;\(\)\[\]\/\@\#\$\%\&\*\+\=]*)"
+    )
+
+    def _wrap(m: re.Match) -> str:
+        run = m.group(1).strip()
+        if not run:
+            return m.group(1)
+        return f'<span dir="ltr" style="unicode-bidi:embed;">{html.escape(run)}</span>'
+
+    return pattern.sub(_wrap, text)
+
 
 def render_markdown(text: str) -> str:
-    """Very small Markdown renderer: fenced code blocks, inline code, bold, headers."""
+    """Small Markdown renderer.
+
+    Direction strategy — one <p> per source line, with an explicit dir
+    attribute. Qt supports `<p dir="rtl|ltr">` and `<span dir="...">`
+    reliably, but does *not* support CSS `unicode-bidi: plaintext`, so
+    we must set direction ourselves line by line.
+    """
     if not text:
         return ""
 
-    # Extract code blocks first so we don't touch them
+    # --- 1) Extract fenced code blocks so their content is untouched -----
     placeholders: list[tuple[str, str]] = []
 
     def _stash(match: re.Match) -> str:
         lang = (match.group(1) or "").strip()
         code = match.group(2)
         escaped = html.escape(code)
-        label = f'<div style="color:#9aa0a6;font-size:11px;margin-bottom:4px;">{lang or "code"}</div>'
+        label = (
+            f'<div dir="ltr" style="color:#9aa0a6;font-size:11px;'
+            f'margin-bottom:4px;text-align:left;">{html.escape(lang or "code")}</div>'
+        )
         block = (
-            f'<div style="background:#111214;border:1px solid #2a2b2f;border-radius:6px;'
-            f'padding:10px;margin:6px 0;">{label}'
-            f'<pre style="margin:0;white-space:pre-wrap;font-family:Consolas,Menlo,monospace;'
-            f'font-size:12px;color:#e6e6e6;">{escaped}</pre></div>'
+            f'<div dir="ltr" style="background:#111214;border:1px solid #2a2b2f;'
+            f'border-radius:6px;padding:10px;margin:6px 0;text-align:left;">'
+            f"{label}"
+            f'<pre style="margin:0;white-space:pre-wrap;'
+            f'font-family:Consolas,Menlo,monospace;font-size:12px;color:#e6e6e6;">'
+            f"{escaped}</pre></div>"
         )
         token = f"@@CODEBLOCK_{len(placeholders)}@@"
         placeholders.append((token, block))
@@ -48,44 +119,73 @@ def render_markdown(text: str) -> str:
 
     body = _CODE_BLOCK_RE.sub(_stash, text)
 
-    # Escape everything else
+    # --- 2) Escape everything, then apply inline markdown ---------------
     body = html.escape(body)
 
-    # Inline code
+    # Inline code -> LTR inline span
     body = re.sub(
         r"`([^`\n]+)`",
-        r'<code style="background:#2a2b2f;padding:1px 5px;border-radius:4px;">\1</code>',
+        r'<span dir="ltr" style="background:#2a2b2f;padding:1px 5px;'
+        r'border-radius:4px;font-family:Consolas,Menlo,monospace;">\1</span>',
         body,
     )
+
     # Bold
     body = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", body)
-    # Headers
-    body = re.sub(
-        r"^### (.+)$",
-        r"<h4 style='margin:8px 0 4px 0;'>\1</h4>",
-        body,
-        flags=re.MULTILINE,
-    )
-    body = re.sub(
-        r"^## (.+)$",
-        r"<h3 style='margin:10px 0 4px 0;'>\1</h3>",
-        body,
-        flags=re.MULTILINE,
-    )
-    body = re.sub(
-        r"^# (.+)$",
-        r"<h2 style='margin:12px 0 6px 0;'>\1</h2>",
-        body,
-        flags=re.MULTILINE,
-    )
-    # Newlines
-    body = body.replace("\n", "<br>")
 
-    # Restore code blocks
-    for token, block in placeholders:
-        body = body.replace(token, block)
+    # --- 3) Restore code-block placeholders before line splitting -------
+    # We use a sentinel that survives the line loop without containing \n.
+    # Each placeholder already has its own <div>, so we can treat it as its
+    # own "line" during rendering.
+    CODE_TOKEN_SENTINEL = "\ue000"  # private-use area, won't appear in text
+    for i, (token, block) in enumerate(placeholders):
+        body = body.replace(token, f"{CODE_TOKEN_SENTINEL}{i}{CODE_TOKEN_SENTINEL}")
 
-    return body
+    # --- 4) Split into lines and render each as its own <p> -------------
+    raw_lines = body.split("\n")
+    out_parts: list[str] = []
+
+    for line in raw_lines:
+        stripped = line.rstrip()
+
+        # Handle code-block sentinels on their own line
+        if CODE_TOKEN_SENTINEL in stripped:
+            # Replace each sentinel with its block; keep the rest of the line
+            def _restore(m: re.Match) -> str:
+                idx = int(m.group(1))
+                return placeholders[idx][1]
+
+            line = re.sub(
+                f"{CODE_TOKEN_SENTINEL}(\\d+){CODE_TOKEN_SENTINEL}",
+                _restore,
+                stripped,
+            )
+            out_parts.append(line)
+            continue
+
+        if not stripped:
+            # Preserve blank lines as a thin spacer paragraph.
+            out_parts.append(
+                '<p style="margin:0;height:6px;line-height:6px;">&nbsp;</p>'
+            )
+            continue
+
+        direction = _line_direction(stripped)
+
+        if direction == "rtl":
+            out_parts.append(f'<p dir="rtl" style="margin:2px 0;">{stripped}</p>')
+        elif direction == "ltr":
+            out_parts.append(f'<p dir="ltr" style="margin:2px 0;">{stripped}</p>')
+        elif direction == "mixed":
+            # Base direction = rtl (persian mixed with english is common).
+            # Isolate Latin runs so they keep their own direction.
+            isolated = _isolate_ltr_runs(stripped)
+            out_parts.append(f'<p dir="rtl" style="margin:2px 0;">{isolated}</p>')
+        else:
+            # Neutral line (numbers, punctuation only).
+            out_parts.append(f'<p dir="auto" style="margin:2px 0;">{stripped}</p>')
+
+    return "".join(out_parts)
 
 
 class MessageWidget(QFrame):
@@ -100,21 +200,26 @@ class MessageWidget(QFrame):
 
         self.setFrameShape(QFrame.NoFrame)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        name = QLabel("You" if role == "user" else "DeepSeek Agent")
+        header.setContentsMargins(0, 0, 0, 0)
+
+        name = QLabel("You" if role == "user" else "Assistant")
         name.setObjectName("Title")
-        header.addWidget(name)
+        header.addWidget(name, alignment=Qt.AlignVCenter)
         header.addStretch(1)
 
         if role == "assistant":
             copy_btn = QPushButton("Copy")
-            copy_btn.setFixedHeight(24)
+            copy_btn.setObjectName("CopyButton")
+            copy_btn.setMinimumHeight(32)
+            copy_btn.setMinimumWidth(72)
+            copy_btn.setCursor(Qt.PointingHandCursor)
             copy_btn.clicked.connect(self._copy)
-            header.addWidget(copy_btn)
+            header.addWidget(copy_btn, alignment=Qt.AlignVCenter)
 
         layout.addLayout(header)
 
@@ -125,6 +230,7 @@ class MessageWidget(QFrame):
         self.browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.browser.document().setDocumentMargin(0)
+        self.browser.setStyleSheet("QTextBrowser { background: transparent; }")
         font = QFont()
         font.setPointSize(10)
         self.browser.setFont(font)
@@ -146,9 +252,14 @@ class MessageWidget(QFrame):
 
     def _autosize(self) -> None:
         doc = self.browser.document()
-        doc.setTextWidth(self.browser.viewport().width() or 600)
-        height = int(doc.size().height()) + 8
-        self.browser.setFixedHeight(max(24, height))
+        width = self.browser.viewport().width()
+        if width <= 0:
+            width = 600
+        doc.setTextWidth(width)
+        doc.adjustSize()
+        height = int(doc.size().height()) + 16
+        height = max(height, 44)
+        self.browser.setFixedHeight(height)
         self.updateGeometry()
 
     def _copy(self) -> None:
@@ -158,7 +269,7 @@ class MessageWidget(QFrame):
 class ChatView(QScrollArea):
     """Scrollable list of MessageWidget instances."""
 
-    message_appended = Signal(str)  # role
+    message_appended = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -204,9 +315,13 @@ class ChatView(QScrollArea):
     def end_streaming(self) -> None:
         self._current = None
 
-    def set_last_assistant(self, content: str) -> None:
+    def has_active_stream(self) -> bool:
+        return self._current is not None
+
+    def finalize_stream(self, content: str) -> None:
         if self._current is not None:
             self._current.set_content(content)
+        self._current = None
 
     def _scroll_to_bottom(self) -> None:
         bar = self.verticalScrollBar()

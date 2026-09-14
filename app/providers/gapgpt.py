@@ -1,4 +1,4 @@
-"""DeepSeek provider implementing OpenAI-compatible chat + tool calling."""
+"""GapGPT provider — OpenAI-compatible chat + tool calling."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from .base import ChatMessage, LLMProvider, LLMResponse, ToolCall
 log = logging.getLogger(__name__)
 
 
-class DeepSeekError(Exception):
-    """Raised for any DeepSeek API error."""
+class GapGPTError(Exception):
+    """Raised for any GapGPT API error."""
 
 
 def _decode_response(response: requests.Response) -> str:
@@ -27,19 +27,19 @@ def _decode_response(response: requests.Response) -> str:
     return text
 
 
-class DeepSeekProvider(LLMProvider):
-    """Concrete provider for the DeepSeek API."""
+class GapGPTProvider(LLMProvider):
+    """Concrete provider for the GapGPT API (OpenAI-compatible)."""
 
-    name = "deepseek"
+    name = "gapgpt"
 
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek-chat",
-        base_url: str = "https://api.deepseek.com",
+        model: str = "gpt-4o",
+        base_url: str = "https://api.gapgpt.app/v1",
         temperature: float = 0.2,
         max_tokens: int = 4096,
-        timeout: int = 45,
+        timeout: int = 60,
     ) -> None:
         self.api_key = api_key.strip()
         self.model = model
@@ -48,7 +48,6 @@ class DeepSeekProvider(LLMProvider):
         self.max_tokens = max_tokens
         self.timeout = timeout
 
-    # ------------------------------------------------------------------ #
     def is_configured(self) -> bool:
         return bool(self.api_key)
 
@@ -56,7 +55,7 @@ class DeepSeekProvider(LLMProvider):
         return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
+            "Accept": "application/json, text/event-stream",
             "Accept-Charset": "utf-8",
         }
 
@@ -73,11 +72,33 @@ class DeepSeekProvider(LLMProvider):
                 return True, "Connected"
             if r.status_code == 401:
                 return False, "Authentication failed (401). Check your API key."
+            if r.status_code == 404:
+                return self._probe_chat()
             return False, f"HTTP {r.status_code}: {_decode_response(r)[:200]}"
         except requests.RequestException as exc:
             return False, f"Network error: {exc}"
 
-    # ------------------------------------------------------------------ #
+    def _probe_chat(self) -> tuple[bool, str]:
+        try:
+            r = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers=self._headers(),
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "stream": False,
+                },
+                timeout=20,
+            )
+            if r.status_code < 400:
+                return True, "Connected (via chat probe)"
+            if r.status_code == 401:
+                return False, "Authentication failed (401). Check your API key."
+            return False, f"HTTP {r.status_code}: {_decode_response(r)[:200]}"
+        except requests.RequestException as exc:
+            return False, f"Network error: {exc}"
+
     def chat(
         self,
         messages: list[ChatMessage],
@@ -87,7 +108,7 @@ class DeepSeekProvider(LLMProvider):
         cancel_flag: Callable[[], bool] | None = None,
     ) -> LLMResponse:
         if not self.api_key:
-            raise DeepSeekError("DeepSeek API key is not configured.")
+            raise GapGPTError("GapGPT API key is not configured.")
 
         payload: dict[str, Any] = {
             "model": self.model,
@@ -102,13 +123,30 @@ class DeepSeekProvider(LLMProvider):
 
         url = f"{self.base_url}/chat/completions"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        log.info(
+            "[gapgpt] POST %s model=%s stream=%s tools=%d messages=%d",
+            url,
+            self.model,
+            stream,
+            len(tools or []),
+            len(messages),
+        )
 
         if stream:
-            return self._stream_chat(url, body, on_token, cancel_flag)
-        return self._blocking_chat(url, body)
+            try:
+                return self._stream_chat(url, body, on_token, cancel_flag)
+            except GapGPTError as exc:
+                log.warning("[gapgpt] streaming failed (%s); falling back", exc)
+                return self._blocking_chat(url, body, on_token)
 
-    # ------------------------------------------------------------------ #
-    def _blocking_chat(self, url: str, body: bytes) -> LLMResponse:
+        return self._blocking_chat(url, body, on_token)
+
+    def _blocking_chat(
+        self,
+        url: str,
+        body: bytes,
+        on_token: Callable[[str], None] | None = None,
+    ) -> LLMResponse:
         payload = json.loads(body.decode("utf-8"))
         payload["stream"] = False
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -118,18 +156,29 @@ class DeepSeekProvider(LLMProvider):
                 url, headers=self._headers(), data=body, timeout=self.timeout
             )
         except requests.Timeout as exc:
-            raise DeepSeekError(f"Request timed out after {self.timeout}s.") from exc
+            raise GapGPTError(f"Request timed out after {self.timeout}s.") from exc
         except requests.RequestException as exc:
-            raise DeepSeekError(f"Network error: {exc}") from exc
+            raise GapGPTError(f"Network error: {exc}") from exc
 
         self._raise_for_status(r)
-        data = json.loads(_decode_response(r))
+        text = _decode_response(r)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise GapGPTError(
+                f"Upstream returned non-JSON response: {text[:200]!r}"
+            ) from exc
+
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message", {}) or {}
         usage = data.get("usage", {}) or {}
 
+        content = message.get("content") or ""
+        if content and on_token:
+            on_token(content)
+
         return LLMResponse(
-            content=message.get("content") or "",
+            content=content,
             tool_calls=_parse_tool_calls(message.get("tool_calls")),
             finish_reason=choice.get("finish_reason", "stop"),
             input_tokens=int(usage.get("prompt_tokens", 0)),
@@ -159,6 +208,34 @@ class DeepSeekProvider(LLMProvider):
             ) as r:
                 r.encoding = "utf-8"
                 self._raise_for_status(r)
+
+                content_type = r.headers.get("Content-Type", "").lower()
+                if "text/event-stream" not in content_type:
+                    raw = r.content
+                    if raw.startswith(b"\xef\xbb\xbf"):
+                        raw = raw[3:]
+                    text = raw.decode("utf-8", errors="replace")
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        raise GapGPTError(
+                            f"Upstream did not return SSE and body wasn't JSON "
+                            f"(Content-Type={content_type!r})."
+                        ) from exc
+                    choice = (data.get("choices") or [{}])[0]
+                    message = choice.get("message", {}) or {}
+                    usage = data.get("usage", {}) or {}
+                    text_content = message.get("content") or ""
+                    if text_content and on_token:
+                        on_token(text_content)
+                    return LLMResponse(
+                        content=text_content,
+                        tool_calls=_parse_tool_calls(message.get("tool_calls")),
+                        finish_reason=choice.get("finish_reason", "stop"),
+                        input_tokens=int(usage.get("prompt_tokens", 0)),
+                        output_tokens=int(usage.get("completion_tokens", 0)),
+                    )
+
                 for raw_line in r.iter_lines(decode_unicode=True):
                     if cancel_flag and cancel_flag():
                         break
@@ -212,11 +289,11 @@ class DeepSeekProvider(LLMProvider):
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
         except requests.Timeout as exc:
-            raise DeepSeekError(
+            raise GapGPTError(
                 f"Streaming request timed out after {self.timeout}s."
             ) from exc
         except requests.RequestException as exc:
-            raise DeepSeekError(f"Network error: {exc}") from exc
+            raise GapGPTError(f"Network error: {exc}") from exc
 
         tool_calls: list[ToolCall] = []
         for slot in tool_acc.values():
@@ -242,7 +319,6 @@ class DeepSeekProvider(LLMProvider):
             output_tokens=output_tokens,
         )
 
-    # ------------------------------------------------------------------ #
     @staticmethod
     def _raise_for_status(r: requests.Response) -> None:
         if r.status_code < 400:
@@ -256,12 +332,14 @@ class DeepSeekProvider(LLMProvider):
         except Exception:  # noqa: BLE001
             pass
         if r.status_code == 401:
-            raise DeepSeekError(f"Authentication failed (401): {detail}")
+            raise GapGPTError(f"Authentication failed (401): {detail}")
+        if r.status_code == 402:
+            raise GapGPTError(f"Payment required (402): {detail}")
         if r.status_code == 429:
-            raise DeepSeekError(f"Rate limit exceeded (429): {detail}")
+            raise GapGPTError(f"Rate limit exceeded (429): {detail}")
         if 500 <= r.status_code < 600:
-            raise DeepSeekError(f"Server error ({r.status_code}): {detail}")
-        raise DeepSeekError(f"HTTP {r.status_code}: {detail}")
+            raise GapGPTError(f"Server error ({r.status_code}): {detail}")
+        raise GapGPTError(f"HTTP {r.status_code}: {detail}")
 
 
 def _parse_tool_calls(raw: Any) -> list[ToolCall]:
