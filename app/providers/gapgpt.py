@@ -133,11 +133,7 @@ class GapGPTProvider(LLMProvider):
         )
 
         if stream:
-            try:
-                return self._stream_chat(url, body, on_token, cancel_flag)
-            except GapGPTError as exc:
-                log.warning("[gapgpt] streaming failed (%s); falling back", exc)
-                return self._blocking_chat(url, body, on_token)
+            return self._stream_chat(url, body, on_token, cancel_flag)
 
         return self._blocking_chat(url, body, on_token)
 

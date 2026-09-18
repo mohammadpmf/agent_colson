@@ -76,13 +76,8 @@ class RunCommandTool(Tool):
                 dangerous=dangerous,
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied command execution.")
-        if dangerous and decision != PermissionDecision.ALWAYS_ALLOW:
-            return ToolResult(
-                ok=False,
-                error="Dangerous command requires explicit Allow Once / Always Allow.",
-            )
 
         env = os.environ.copy()
         env.setdefault("PYTHONIOENCODING", "utf-8")

@@ -32,7 +32,7 @@ class ToolResult:
     def to_model_string(self) -> str:
         if self.ok:
             return self.output or "(no output)"
-        return f"ERROR: {self.error or self.output or 'unknown error'}"
+        return f"ERROR: {self.error or 'unknown error'}\n{self.output}".strip()
 
 
 class Tool(ABC):

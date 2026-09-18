@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import fnmatch
 import re
 from pathlib import Path
@@ -13,6 +14,7 @@ from app.permissions import (
     PermissionRequest,
 )
 from app.security import SecurityViolation
+from app.workspace.manager import IGNORED_DIRS
 
 from .base import Tool, ToolContext, ToolResult
 
@@ -52,11 +54,11 @@ class SearchFilesTool(Tool):
                 reason=f"Search files matching {pattern}",
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied search.")
 
         results: list[str] = []
-        for p in base.rglob("*"):
+        for p in _safe_files(base, ctx):
             if len(results) >= MAX_RESULTS:
                 break
             if p.is_file() and fnmatch.fnmatch(p.name, pattern):
@@ -112,7 +114,7 @@ class SearchTextTool(Tool):
                 reason=f"Search text: {query[:60]}",
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied search.")
 
         try:
@@ -124,12 +126,14 @@ class SearchTextTool(Tool):
 
         matches: list[str] = []
         total = 0
-        for path in base.rglob("*"):
+        for path in _safe_files(base, ctx):
             if total >= MAX_RESULTS:
                 break
             if not path.is_file():
                 continue
             if exts and path.suffix.lower() not in exts:
+                continue
+            if ctx.workspace.guard().is_sensitive(path):
                 continue
             if not ctx.workspace.is_text_file(path):
                 continue
@@ -138,6 +142,8 @@ class SearchTextTool(Tool):
                     continue
                 content = path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
+                continue
+            if ctx.workspace.guard().contains_secret(content):
                 continue
             for i, line in enumerate(content.splitlines(), start=1):
                 if matcher.search(line):
@@ -153,3 +159,16 @@ class SearchTextTool(Tool):
             output="\n".join(matches) if matches else "(no matches)",
             data={"count": total},
         )
+
+
+def _safe_files(base: Path, ctx: ToolContext):
+    for root, directories, files in os.walk(base, followlinks=False):
+        directories[:] = [name for name in directories if name not in IGNORED_DIRS and not (Path(root) / name).is_symlink()]
+        for name in files:
+            path = Path(root) / name
+            if path.is_symlink():
+                continue
+            try:
+                yield ctx.workspace.resolve(path)
+            except SecurityViolation:
+                continue

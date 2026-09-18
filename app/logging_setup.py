@@ -22,7 +22,7 @@ class _RedactingFilter(logging.Filter):
         for pat in _SECRET_PATTERNS:
             if pat.groups >= 2:
                 msg = pat.sub(
-                    lambda m: m.group(1) + "***REDACTED***" + m.group(m.lastindex or 1),
+                    lambda m: m.group(1) + "***REDACTED***" + (m.group(2) if m.group(2) == chr(34) else ""),
                     msg,
                 )
             else:

@@ -26,6 +26,10 @@ class StoredMessage:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "StoredMessage":
+        if not isinstance(raw, dict) or not isinstance(raw.get("content", ""), str):
+            raise ValueError("Invalid stored message")
+        if not isinstance(raw.get("tool_calls", []), list) or any(not isinstance(call, dict) for call in raw.get("tool_calls", [])):
+            raise ValueError("Invalid stored tool calls")
         return cls(
             role=raw.get("role", "user"),
             content=raw.get("content", ""),
@@ -59,6 +63,14 @@ class Conversation:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Conversation":
+        if not isinstance(raw, dict):
+            raise ValueError("Invalid conversation")
+        for key in ("title", "workspace", "model"):
+            if key in raw and not isinstance(raw[key], str):
+                raise ValueError(f"Invalid conversation {key}")
+        for key in ("created_at", "updated_at"):
+            if key in raw and not isinstance(raw[key], (int, float)):
+                raise ValueError(f"Invalid conversation {key}")
         return cls(
             id=raw.get("id", _new_id()),
             title=raw.get("title", "New Chat"),

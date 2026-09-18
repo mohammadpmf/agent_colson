@@ -14,5 +14,5 @@ logs/*.log
 *.egg-info/
 data/
 logs/
-tests/
+artifacts/
 

@@ -49,7 +49,7 @@ class PermissionManager:
     def check(self, request: PermissionRequest) -> PermissionDecision:
         """Return the decision for a request, prompting the user if needed."""
         # 1) explicit rule match
-        if self._has_rule(request.action, request.target):
+        if not request.dangerous and self._has_rule(request.action, request.target):
             self.storage.log(
                 request.action.value, request.target, "allowed_by_rule", request.reason
             )
@@ -65,7 +65,7 @@ class PermissionManager:
         decision = self.ask_callback(request)
 
         # 3) persist ALWAYS_ALLOW
-        if decision == PermissionDecision.ALWAYS_ALLOW:
+        if decision == PermissionDecision.ALWAYS_ALLOW and not request.dangerous:
             scope = self._resolve_scope(request)
             target = self._scope_target(request, scope)
             self.storage.add_rule(
@@ -104,7 +104,7 @@ class PermissionManager:
             if rule.scope == PermissionScope.GLOBAL:
                 return True
             if rule.scope == PermissionScope.WORKSPACE:
-                if _is_inside(self.workspace_root, target_path):
+                if _norm(rule.target) == _norm(self.workspace_root) and _is_inside(self.workspace_root, target_path):
                     return True
             if rule.scope in (PermissionScope.FILE, PermissionScope.DIRECTORY):
                 rule_path = _norm(rule.target)

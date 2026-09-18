@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from copy import deepcopy
+from .workers import run_in_thread
 from app.config import AppConfig
 from app.permissions import PermissionManager
 
@@ -43,7 +45,8 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         self.setMinimumSize(680, 560)
 
-        self.config = config
+        self.config = deepcopy(config)
+        self._testing = False
         self.permissions = permissions
 
         layout = QVBoxLayout(self)
@@ -154,6 +157,8 @@ class SettingsDialog(QDialog):
         self.edit_mode = QComboBox()
         self.edit_mode.addItems(["ask", "ask_first", "auto"])
         self.edit_mode.setCurrentText(self.config.edit_mode)
+        self.edit_mode.setEnabled(False)
+        self.edit_mode.setToolTip("File operations use the Permissions rules below.")
         form.addRow("File edit mode:", self.edit_mode)
 
         return w
@@ -222,8 +227,7 @@ class SettingsDialog(QDialog):
             model=self.gap_model_edit.text().strip() or "gpt-4o",
             base_url=self.gap_url_edit.text().strip() or "https://api.gapgpt.app/v1",
         )
-        ok, msg = provider.test_connection()
-        self._set_conn_label(self.gap_conn_label, ok, msg)
+        self._test_provider(provider, self.gap_conn_label)
 
     def _test_deepseek(self) -> None:
         from app.providers import DeepSeekProvider
@@ -233,8 +237,29 @@ class SettingsDialog(QDialog):
             model=self.ds_model_edit.text().strip() or "deepseek-chat",
             base_url=self.ds_url_edit.text().strip() or "https://api.deepseek.com",
         )
-        ok, msg = provider.test_connection()
-        self._set_conn_label(self.ds_conn_label, ok, msg)
+        self._test_provider(provider, self.ds_conn_label)
+
+    def _test_provider(self, provider, label) -> None:
+        if self._testing:
+            return
+        self._testing = True
+        label.setText("Testing connection…")
+
+        def done(result):
+            self._set_conn_label(label, *result)
+
+        def failed(error):
+            self._set_conn_label(label, False, error)
+
+        self._test_thread, self._test_worker = run_in_thread(self, provider.test_connection, done, failed)
+        self._test_thread.finished.connect(self._test_finished)
+
+    def _test_finished(self):
+        self._testing = False
+
+    def done(self, result):
+        if not self._testing:
+            super().done(result)
 
     @staticmethod
     def _set_conn_label(label: QLabel, ok: bool, msg: str) -> None:
@@ -247,6 +272,8 @@ class SettingsDialog(QDialog):
 
     # ------------------------------------------------------------------ #
     def _save(self) -> None:
+        if self._testing:
+            return
         self.config.provider = self.provider_combo.currentText()
 
         self.config.gapgpt_api_key = self.gap_key_edit.text().strip()

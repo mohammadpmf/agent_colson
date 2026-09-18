@@ -50,7 +50,7 @@ class ListDirectoryTool(Tool):
                 details={"depth": depth},
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied listing this directory.")
 
         entries = ctx.workspace.list_entries(rel, depth=depth)
@@ -110,7 +110,7 @@ class ReadFileTool(Tool):
                 dangerous=sensitive,
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied reading this file.")
 
         text = _read_text(path)
@@ -120,7 +120,17 @@ class ReadFileTool(Tool):
             )
 
         secrets = guard.contains_secret(text)
+        if secrets:
+            approval = ctx.permissions.check(PermissionRequest(
+                action=PermissionAction.READ_FILE, target=str(path),
+                reason="Send file content containing possible secrets to the AI provider",
+                dangerous=True,
+            ))
+            if approval not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
+                return ToolResult(ok=False, error="User denied sharing possible secrets.")
         lines = text.splitlines()
+        if not lines:
+            return ToolResult(ok=True, output="(empty file)")
         start = int(arguments.get("start_line", 1))
         end = int(arguments.get("end_line", len(lines)))
         start = max(1, start)
@@ -180,7 +190,7 @@ class WriteFileTool(Tool):
                 details={"new_size": len(content)},
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied writing this file.")
 
         backup = _make_backup(path)
@@ -229,7 +239,7 @@ class CreateFileTool(Tool):
                 reason="Create a new file",
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied creating this file.")
 
         try:
@@ -276,7 +286,7 @@ class DeleteFileTool(Tool):
                 dangerous=True,
             )
         )
-        if decision != PermissionDecision.ALWAYS_ALLOW:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="Deletion cancelled by user.")
 
         try:
@@ -322,7 +332,7 @@ class MoveFileTool(Tool):
                 details={"destination": str(dst)},
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied move.")
 
         try:
@@ -366,7 +376,7 @@ class CopyFileTool(Tool):
                 reason=f"Copy {src.name} → {dst.name}",
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied copy.")
 
         try:
@@ -474,7 +484,7 @@ class ReplaceTextTool(Tool):
                 details={"occurrences": applied},
             )
         )
-        if decision == PermissionDecision.DENY:
+        if decision not in (PermissionDecision.ALLOW_ONCE, PermissionDecision.ALWAYS_ALLOW):
             return ToolResult(ok=False, error="User denied text replacement.")
 
         backup = _make_backup(path)

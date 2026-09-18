@@ -111,11 +111,7 @@ class WorkspaceManager:
     def list_entries(self, relative: str = ".", depth: int = 1) -> list[FileEntry]:
         if self._root is None:
             raise RuntimeError("No workspace is open.")
-        base = (
-            (self._root / relative).resolve()
-            if relative not in (".", "")
-            else self._root
-        )
+        base = self.resolve(relative)
         if not base.is_dir():
             return []
 
@@ -131,7 +127,7 @@ class WorkspaceManager:
         except (OSError, PermissionError):
             return
         for child in children:
-            if child.name in IGNORED_DIRS:
+            if child.name in IGNORED_DIRS or child.is_symlink():
                 continue
             try:
                 is_dir = child.is_dir()
@@ -160,7 +156,8 @@ class WorkspaceManager:
             return True
         # Fallback: sniff for NUL bytes
         try:
-            chunk = path.read_bytes()[:2048]
+            with path.open("rb") as handle:
+                chunk = handle.read(2048)
         except OSError:
             return False
         return b"\x00" not in chunk

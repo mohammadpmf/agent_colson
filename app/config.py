@@ -91,8 +91,8 @@ class AppConfig:
         return d
 
     def save(self) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "settings.json").write_text(
             json.dumps(self.to_public_dict(), indent=2), encoding="utf-8"
         )
         _save_credentials(self)
@@ -108,14 +108,15 @@ class AppConfig:
 
 # ---------------------------------------------------------------------- #
 def _save_credentials(cfg: AppConfig) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    credentials_file = cfg.data_dir / "credentials.json"
     payload = {
         "gapgpt_api_key": cfg.gapgpt_api_key,
         "deepseek_api_key": cfg.deepseek_api_key,
     }
-    CREDENTIALS_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    credentials_file.write_text(json.dumps(payload), encoding="utf-8")
     try:
-        os.chmod(CREDENTIALS_FILE, 0o600)
+        os.chmod(credentials_file, 0o600)
     except OSError:
         pass
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from html import escape
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
@@ -66,6 +68,7 @@ class PermissionDialog(QDialog):
 
         always = QPushButton("Always Allow")
         always.clicked.connect(self._always)
+        always.setEnabled(not request.dangerous)
 
         buttons.addWidget(deny)
         buttons.addWidget(once)
@@ -76,13 +79,13 @@ class PermissionDialog(QDialog):
     def _render(self, req: PermissionRequest) -> str:
         parts = [
             f"<b>Action:</b> {req.action.value}",
-            f"<b>Target:</b> <code>{req.target}</code>",
+            f"<b>Target:</b> <code>{escape(req.target)}</code>",
         ]
         if req.reason:
-            parts.append(f"<b>Why:</b> {req.reason}")
+            parts.append(f"<b>Why:</b> {escape(req.reason)}")
         if req.details:
             details = "<br>".join(
-                f"&nbsp;&nbsp;<b>{k}:</b> {v}" for k, v in req.details.items()
+                f"&nbsp;&nbsp;<b>{escape(str(k))}:</b> {escape(str(v))}" for k, v in req.details.items()
             )
             parts.append(f"<b>Details:</b><br>{details}")
         return "<br><br>".join(parts)

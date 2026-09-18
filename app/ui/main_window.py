@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import time
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QEventLoop
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -46,6 +47,7 @@ from app.workspace import WorkspaceManager
 
 from .activity import ActivityPanel
 from .chat_view import ChatView
+from .text_direction import text_direction
 from .explorer import ExplorerPanel
 from .permission_dialog import PermissionDialog
 from .settings_dialog import SettingsDialog
@@ -68,6 +70,9 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
 
         self._agent_event.connect(self._apply_agent_event)
+        self._permission_requested.connect(self._show_permission, Qt.QueuedConnection)
+        self._busy = False
+        self._closing = False
 
         # ---- core services ------------------------------------------------
         self.workspace = WorkspaceManager()
@@ -102,6 +107,7 @@ class MainWindow(QMainWindow):
         self._wire_shortcuts()
         self._refresh_recent_chats()
         self._update_workspace_label()
+        self.explorer.refresh()
 
         QTimer.singleShot(100, self._refresh_connection_status)
 
@@ -124,6 +130,7 @@ class MainWindow(QMainWindow):
         self.explorer = ExplorerPanel(self.workspace)
         self.explorer.file_selected.connect(self._on_file_selected)
         self.explorer.open_workspace_requested.connect(self._choose_workspace)
+        self.explorer.conversation_selected.connect(self._load_chat)
         splitter.addWidget(self.explorer)
 
         chat_container = QWidget()
@@ -199,10 +206,12 @@ class MainWindow(QMainWindow):
         self.input.setPlaceholderText(
             "Ask the agent to inspect, modify, or run something… (Ctrl+Enter to send)"
         )
+        self.input.setAcceptRichText(False)
+        self.input.textChanged.connect(self._update_input_direction)
         self.input.setFixedHeight(84)
         layout.addWidget(self.input, stretch=1)
 
-        send_btn = QPushButton("Send")
+        send_btn = self.send_btn = QPushButton("Send")
         send_btn.setObjectName("Primary")
         send_btn.setFixedWidth(96)
         send_btn.clicked.connect(self._send)
@@ -287,6 +296,13 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(stylesheet(name))
 
     def _refresh_connection_status(self) -> None:
+        if self._conn_thread is not None:
+            try:
+                if self._conn_thread.isRunning():
+                    QTimer.singleShot(500, self._refresh_connection_status)
+                    return
+            except RuntimeError:
+                pass
         if not self.config.api_key:
             self.conn_status.setText("● not configured")
             self.conn_status.setObjectName("StatusBad")
@@ -317,8 +333,6 @@ class MainWindow(QMainWindow):
                 )
             return p.test_connection()
 
-        thread, worker = run_in_thread(self, _test)
-
         def _on_done(result) -> None:
             ok, msg = result
             if ok:
@@ -342,8 +356,7 @@ class MainWindow(QMainWindow):
             self._restyle(self.conn_status)
             self.activity.add(f"{provider_name} test failed: {err}", "!")
 
-        worker.finished.connect(_on_done)
-        worker.failed.connect(_on_fail)
+        thread, worker = run_in_thread(self, _test, _on_done, _on_fail)
         self._conn_thread = thread
         self._conn_worker = worker
 
@@ -370,6 +383,9 @@ class MainWindow(QMainWindow):
     # Workspace
     # ------------------------------------------------------------------ #
     def _choose_workspace(self) -> None:
+        if self._busy:
+            self._set_status("Stop the current response before changing workspace.")
+            return
         path = QFileDialog.getExistingDirectory(self, "Choose Workspace Folder")
         if not path:
             return
@@ -392,15 +408,18 @@ class MainWindow(QMainWindow):
             self.workspace.resolve(path)
         except Exception:  # noqa: BLE001
             return
-        rel = Path(path).name
+        rel = Path(path).relative_to(self.workspace.root).as_posix()
         self.input.insertPlainText(f"Please read `{rel}` and explain its purpose.\n")
 
     # ------------------------------------------------------------------ #
     # Conversation
     # ------------------------------------------------------------------ #
     def _new_chat(self) -> None:
-        if self.conversation.messages:
-            self.conversation_store.save(self.conversation)
+        if self._busy:
+            self._set_status("Stop the current response before starting a new chat.")
+            return
+        if not self._save_chat():
+            return
         self.conversation = Conversation(
             workspace=str(self.workspace.root or ""),
             model=self.config.model,
@@ -413,7 +432,67 @@ class MainWindow(QMainWindow):
 
     def _refresh_recent_chats(self) -> None:
         items = [(c.id, c.title) for c in self.conversation_store.list_all()]
-        self.explorer.set_recent_chats(items)
+        self.explorer.set_recent_chats(items, self.conversation.id)
+
+    def _save_chat(self) -> bool:
+        if not self.conversation.messages:
+            return True
+        if self.conversation_store.save(self.conversation):
+            return True
+        QMessageBox.warning(self, "Save failed", "Could not save this conversation. Check disk space and folder permissions.")
+        return False
+
+    def _load_chat(self, conversation_id: str) -> None:
+        if self._busy:
+            self._refresh_recent_chats()
+            self._set_status("Stop the current response before opening another chat.")
+            return
+        if conversation_id == self.conversation.id or not self._save_chat():
+            return
+        conversation = self.conversation_store.load(conversation_id)
+        if conversation is None:
+            QMessageBox.warning(self, "Chat unavailable", "This conversation could not be loaded.")
+            return
+        workspace = WorkspaceManager()
+        if conversation.workspace:
+            try:
+                workspace.set_root(conversation.workspace)
+            except (OSError, ValueError):
+                QMessageBox.warning(self, "Workspace unavailable", "The saved workspace no longer exists. Choose a workspace before using Agent mode.")
+        self.workspace = workspace
+        self.explorer.workspace = workspace
+        self.permissions.set_workspace(workspace.root or self.config.data_dir)
+        self.config.workspace = str(workspace.root or "")
+        self.conversation = conversation
+        self.chat.clear()
+        self.activity.clear()
+        self.input.clear()
+        for message in conversation.messages:
+            if message.role in {"user", "assistant"} and message.content:
+                self.chat.add_message(message.role, message.content)
+            elif message.role == "tool":
+                self.activity.add(f"{message.tool_name}: {message.content[:300]}")
+        self.explorer.refresh()
+        self._update_workspace_label()
+        self._refresh_recent_chats()
+        self._set_tokens(0, 0)
+        self._set_status(f"Opened: {conversation.title}")
+        self.input.setFocus()
+
+    def _update_input_direction(self) -> None:
+        self.input.blockSignals(True)
+        try:
+            block = self.input.document().begin()
+            while block.isValid():
+                rtl = text_direction(block.text()) == "rtl"
+                cursor = QTextCursor(block)
+                fmt = block.blockFormat()
+                fmt.setLayoutDirection(Qt.RightToLeft if rtl else Qt.LeftToRight)
+                fmt.setAlignment((Qt.AlignRight if rtl else Qt.AlignLeft) | Qt.AlignAbsolute)
+                cursor.setBlockFormat(fmt)
+                block = block.next()
+        finally:
+            self.input.blockSignals(False)
 
     # ------------------------------------------------------------------ #
     # Agent
@@ -429,12 +508,12 @@ class MainWindow(QMainWindow):
         )
 
     def _send(self) -> None:
-        if self.agent and self.agent.is_running:
+        if self._busy:
             return
         text = self.input.toPlainText().strip()
         if not text:
             return
-        if self.workspace.root is None:
+        if self.workspace.root is None and self._current_mode() == AgentMode.AGENT:
             QMessageBox.warning(self, "No workspace", "Please open a workspace first.")
             return
         if not self.config.api_key:
@@ -445,12 +524,16 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self.conversation.model = self.config.model
         self.input.clear()
         self.chat.add_message("user", text)
         self.conversation.messages.append(StoredMessage(role="user", content=text))
         if len(self.conversation.messages) == 1:
-            self.conversation.title = text[:60]
+            self.conversation.title = " ".join(text.split())[:60]
 
+        self.conversation.updated_at = time.time()
+        self._save_chat()
+        self._refresh_recent_chats()
         history = self._build_api_history(exclude_last=True)
 
         provider = self._make_provider()
@@ -461,6 +544,7 @@ class MainWindow(QMainWindow):
             registry=self.registry,
             tool_context=tool_ctx,
             mode=self._current_mode(),
+            streaming=self.config.streaming,
             emit=self._handle_agent_event,
             context_manager=ContextManager(
                 max_tokens=12_000,
@@ -468,6 +552,9 @@ class MainWindow(QMainWindow):
                 max_tool_result_chars=2_000,
             ),
         )
+        self._busy = True
+        self.send_btn.setEnabled(False)
+        self.mode_combo.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._set_status("Agent running…")
         self.activity.add("Planning…", "⟳")
@@ -509,7 +596,7 @@ class MainWindow(QMainWindow):
                     history.append(
                         ChatMessage(
                             role="assistant",
-                            content="",
+                            content=m.content,
                             tool_calls=tcs,
                         )
                     )
@@ -526,7 +613,8 @@ class MainWindow(QMainWindow):
                         name=m.tool_name,
                     )
                 )
-        return history
+        from app.context.history import repair_history
+        return repair_history(history)
 
     def _stop(self) -> None:
         if self.agent and self.agent.is_running:
@@ -601,6 +689,9 @@ class MainWindow(QMainWindow):
                     ],
                 )
             )
+            messages = self.conversation.messages
+            if len(messages) > 1 and messages[-2].role == "assistant" and messages[-2].tool_calls:
+                messages[-2].tool_calls.extend(messages.pop().tool_calls)
 
         elif event.type == AgentEventType.TOOL_RESULT:
             name = event.payload.get("name", "")
@@ -621,7 +712,7 @@ class MainWindow(QMainWindow):
         elif event.type == AgentEventType.ERROR:
             msg = event.payload.get("message", "Unknown error")
             self.activity.add(msg, "!")
-            self.chat.end_streaming()
+            self._save_partial_stream()
             self.chat.add_message("assistant", f"⚠️ Error: {msg}")
 
         elif event.type == AgentEventType.USAGE:
@@ -631,14 +722,22 @@ class MainWindow(QMainWindow):
             )
 
         elif event.type == AgentEventType.DONE:
-            self.chat.end_streaming()
+            self._save_partial_stream()
+            self._busy = False
+            self.send_btn.setEnabled(True)
+            self.mode_combo.setEnabled(True)
             state = event.payload.get("state", "completed")
             self._set_status(f"Agent: {state}")
             self.stop_btn.setEnabled(False)
             self.conversation.updated_at = time.time()
-            self.conversation_store.save(self.conversation)
+            self._save_chat()
             self._refresh_recent_chats()
             self._update_workspace_label()
+
+    def _save_partial_stream(self) -> None:
+        content = self.chat.end_streaming()
+        if content:
+            self.conversation.messages.append(StoredMessage(role="assistant", content=content))
 
     def _on_state(self, state: str) -> None:
         mapping = {
@@ -657,28 +756,24 @@ class MainWindow(QMainWindow):
     # Permission flow
     # ------------------------------------------------------------------ #
     def _ask_permission(self, request: PermissionRequest) -> PermissionDecision:
-        result: dict[str, PermissionDecision] = {"decision": PermissionDecision.DENY}
-        loop = QEventLoop()
+        done = threading.Event()
+        holder = {"decision": PermissionDecision.DENY, "done": done}
+        self._permission_requested.emit(request, holder)
+        while not done.wait(0.1):
+            if self._closing or (self.agent and self.agent._cancel.is_set()):
+                return PermissionDecision.DENY
+        return holder["decision"]
 
-        def _handle(req, holder):
-            try:
-                dlg = PermissionDialog(req, self)
-                dlg.exec()
-                holder["decision"] = dlg.decision
-            finally:
-                loop.quit()
-
-        conn = self._permission_requested.connect(_handle)
+    @Slot(object, object)
+    def _show_permission(self, request, holder) -> None:
         try:
-            self._permission_requested.emit(request, result)
-            loop.exec()
+            if self._closing or (self.agent and self.agent._cancel.is_set()):
+                return
+            dialog = PermissionDialog(request, self)
+            dialog.exec()
+            holder["decision"] = dialog.decision
         finally:
-            try:
-                self._permission_requested.disconnect(conn)
-            except (RuntimeError, TypeError):
-                pass
-
-        return result["decision"]
+            holder["done"].set()
 
     # ------------------------------------------------------------------ #
     # Settings / misc
@@ -719,8 +814,23 @@ class MainWindow(QMainWindow):
             self._open_settings()
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self.conversation.messages:
-            self.conversation_store.save(self.conversation)
+        if self._busy:
+            self._stop()
+            self._set_status("Stopping. Close the window again when the response has stopped.")
+            event.ignore()
+            return
+        if self._conn_thread is not None:
+            try:
+                if self._conn_thread.isRunning():
+                    self._set_status("Connection check is finishing; please close again shortly.")
+                    event.ignore()
+                    return
+            except RuntimeError:
+                pass
+        if not self._save_chat():
+            event.ignore()
+            return
+        self._closing = True
         if self.agent and self.agent.is_running:
             self.agent.cancel()
         super().closeEvent(event)

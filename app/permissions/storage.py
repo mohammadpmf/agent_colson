@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .models import (
@@ -23,10 +24,15 @@ class PermissionStorage:
         self._lock = threading.RLock()
         self._init_schema()
 
-    def _conn(self) -> sqlite3.Connection:
+    @contextmanager
+    def _conn(self):
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._lock, self._conn() as conn:

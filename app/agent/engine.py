@@ -90,11 +90,13 @@ class AgentEngine:
         mode: AgentMode = AgentMode.AGENT,
         emit: Callable[[AgentEvent], None] | None = None,
         context_manager: ContextManager | None = None,
+        streaming: bool = True,
     ) -> None:
         self.provider = provider
         self.registry = registry
         self.tool_context = tool_context
         self.mode = mode
+        self.streaming = streaming
         self.emit = emit or (lambda _e: None)
         self.context_manager = context_manager or ContextManager()
 
@@ -150,7 +152,7 @@ class AgentEngine:
 
             for iteration in range(MAX_TOOL_ITERATIONS):
                 if self._cancel.is_set():
-                    self._finish(AgentState.CANCELED)
+                    self._finish(AgentState.CANCELED if self._cancel.is_set() else AgentState.FAILED)
                     return
 
                 log.info("[engine] iteration %d — calling LLM", iteration)
@@ -161,7 +163,7 @@ class AgentEngine:
                 response = self._call_llm(trimmed, tools)
                 if response is None:
                     log.info("[engine] LLM returned None (cancel or error)")
-                    self._finish(AgentState.CANCELED)
+                    self._finish(AgentState.CANCELED if self._cancel.is_set() else AgentState.FAILED)
                     return
 
                 log.info(
@@ -191,6 +193,9 @@ class AgentEngine:
                             {"content": response.content},
                         )
                     )
+
+                if self.mode == AgentMode.ASK and response.tool_calls:
+                    raise RuntimeError("Provider returned tool calls in Ask mode.")
 
                 if not response.tool_calls:
                     self._finish(AgentState.COMPLETED)
@@ -249,10 +254,7 @@ class AgentEngine:
     def _call_llm(
         self, messages: list[ChatMessage], tools: list[dict[str, Any]]
     ) -> LLMResponse | None:
-        streamed_any = {"flag": False}
-
         def on_token(piece: str) -> None:
-            streamed_any["flag"] = True
             self.emit(AgentEvent(AgentEventType.ASSISTANT_TOKEN, {"delta": piece}))
 
         self.state = AgentState.RUNNING
@@ -262,7 +264,7 @@ class AgentEngine:
             response = self.provider.chat(
                 messages=messages,
                 tools=tools or None,
-                stream=True,
+                stream=self.streaming,
                 on_token=on_token,
                 cancel_flag=self._cancel.is_set,
             )
@@ -278,13 +280,6 @@ class AgentEngine:
         if self._cancel.is_set():
             return None
 
-        if response.content and not streamed_any["flag"]:
-            self.emit(
-                AgentEvent(
-                    AgentEventType.ASSISTANT_MESSAGE,
-                    {"content": response.content},
-                )
-            )
         return response
 
     def _execute_tool(self, call: ToolCall) -> ChatMessage:
