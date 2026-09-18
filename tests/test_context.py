@@ -28,6 +28,11 @@ def test_trim_when_large():
     assert cm.stats.summarized is True
     # System prompt preserved
     assert out[0].role == "system"
+    assert out[0].content == "sys"
+    assert out[1].content.startswith("Earlier messages (lossy excerpts")
+    assert "[assistant] reply" in out[1].content
+    assert cm.stats.input_tokens <= cm.max_tokens
+    assert out[-2:] == msgs[-2:]
 
 
 def test_keep_last_preserved():
@@ -38,3 +43,21 @@ def test_keep_last_preserved():
     out = cm.trim(msgs)
     assert out[-1].content == "x" * 100
     assert out[-2].content == "x" * 100
+
+
+def test_summary_flag_resets_on_next_small_request():
+    cm = ContextManager(max_tokens=200, keep_last=2)
+    cm.trim([ChatMessage(role="user", content="old " * 100)] * 20)
+    assert cm.stats.summarized
+    cm.trim([ChatMessage(role="user", content="hello")])
+    assert cm.stats.summarized is False
+    assert cm.stats.dropped_messages == 0
+
+
+def test_no_summary_when_latest_message_alone_exceeds_budget():
+    cm = ContextManager(max_tokens=20)
+    latest = ChatMessage(role="user", content="latest " * 100)
+    out = cm.trim([ChatMessage(role="user", content="old"), latest])
+    assert out == [latest]
+    assert cm.stats.summarized is False
+    assert cm.stats.dropped_messages == 1

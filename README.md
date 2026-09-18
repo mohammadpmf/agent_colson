@@ -71,4 +71,4 @@ Images are written to `artifacts/` (ignored by Git). The preview uses a temporar
 - `app/permissions/`, `app/security/`: permission storage and path/content checks
 - `tests/`: offline regressions and visual preview
 
-Context trimming retains complete tool exchanges and discards older exchanges when over budget. Token counts are estimates; a single oversized latest exchange is retained and may still exceed the provider's limit. Conversation history is local and is sent to the configured provider when you continue chatting. Approved file content and tool output may also be sent.
+Context trimming retains complete tool exchanges and removes older exchanges when over budget. When space remains, it includes a bounded summary made from excerpts of removed messages; the summary flag is true only when that summary is included. Token counts are estimates; a single oversized latest exchange is retained and may still exceed the provider's limit. Conversation history is local and is sent to the configured provider when you continue chatting. Approved file content and tool output may also be sent.

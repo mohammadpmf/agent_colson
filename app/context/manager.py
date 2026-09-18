@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from app.providers import ChatMessage
+from .history import message_groups
 
 # Rough token estimate — 1 token ≈ 4 characters of English text.
 CHARS_PER_TOKEN = 4
@@ -27,8 +29,8 @@ class ContextManager:
     """Trim older complete exchanges while preserving system messages.
 
     Tool results are shortened first. The newest exchange is always retained,
-    even if it alone exceeds the estimated budget. keep_last is accepted for
-    compatibility; protocol integrity takes priority over message counts.
+    even if it alone exceeds the estimated budget. Older messages are kept as
+    bounded excerpts when space remains after retaining recent exchanges.
     """
 
     def __init__(
@@ -47,9 +49,6 @@ class ContextManager:
             self.stats = ContextStats()
             return []
 
-        from .history import message_groups
-        import json
-
         self.stats = ContextStats(total_messages=len(messages))
         shrunk = [self._shrink_tool_result(m) for m in messages]
         systems = [m for m in shrunk if m.role == "system"]
@@ -60,12 +59,41 @@ class ContextManager:
 
         # Drop complete exchanges, never a tool parent without its results.
         budget = cost(systems) + sum(cost(group) for group in groups)
+        removed_messages: list[ChatMessage] = []
         while budget > self.max_tokens and len(groups) > 1:
             removed = groups.pop(0)
             budget -= cost(removed)
-            self.stats.dropped_messages += len(removed)
+            removed_messages.extend(removed)
+
+        summary: list[ChatMessage] = []
+        if removed_messages:
+            # This is an extractive, lossy summary, not an LLM-generated one.
+            # Use the remaining budget without evicting additional recent turns.
+            excerpts = []
+            for message in reversed(removed_messages[-40:]):
+                snippet = " ".join(message.content.split())[:120]
+                if message.tool_calls:
+                    snippet = "Tools: " + ", ".join(call.name for call in message.tool_calls)
+                if snippet:
+                    excerpts.append(f"[{message.role}] {snippet}")
+            text = "\n".join(excerpts)
+            prefix = "Earlier messages (lossy excerpts, newest first):\n"
+            low, high = 1, len(text)
+            while low <= high:
+                length = (low + high) // 2
+                content = prefix + text[:length] + ("…" if length < len(text) else "")
+                candidate = [ChatMessage(role="system", content=content)]
+                if budget + cost(candidate) <= self.max_tokens:
+                    summary = candidate
+                    low = length + 1
+                else:
+                    high = length - 1
+
+        self.stats.dropped_messages = len(removed_messages)
+        self.stats.summarized = bool(summary)
+        budget += cost(summary)
         self.stats.input_tokens = budget
-        return systems + [message for group in groups for message in group]
+        return systems + summary + [message for group in groups for message in group]
 
     # ------------------------------------------------------------------ #
     def _shrink_tool_result(self, message: ChatMessage) -> ChatMessage:
