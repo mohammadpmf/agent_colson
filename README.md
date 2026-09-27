@@ -76,3 +76,6 @@ Context trimming retains complete tool exchanges and removes older exchanges whe
 ## UI
 <img width="1919" height="1039" alt="a" src="https://github.com/user-attachments/assets/eef5d6bf-dd41-4744-853d-bcf1d79322da" />
 <img width="1399" height="932" alt="a2" src="https://github.com/user-attachments/assets/466ffaa2-36f1-4106-92b7-faee6fa1a7ca" />
+
+## Download exe file
+[main.exe file](https://github.com/mohammadpmf/agent_colson_exe)
