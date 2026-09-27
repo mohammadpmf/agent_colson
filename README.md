@@ -78,4 +78,6 @@ Context trimming retains complete tool exchanges and removes older exchanges whe
 <img width="1399" height="932" alt="a2" src="https://github.com/user-attachments/assets/466ffaa2-36f1-4106-92b7-faee6fa1a7ca" />
 
 ## Download exe file
-[main.exe file](https://github.com/mohammadpmf/agent_colson_exe)
+[main.exe file](https://github.com/mohammadpmf/agent_colson_exe "دانلود فایل اجرایی پروژه از روی گیتهاب")
+
+[main.exe file](https://gitlab.chabokan.net/mohammadpmf/agent_colson_exe "دانلود فایل اجرایی پروژه از روی گیت لب چابکان")
